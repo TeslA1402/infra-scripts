@@ -303,8 +303,9 @@ CLIENT_IP="${CLIENT_IP%% *}"
 if ! [[ "$CLIENT_IP" =~ $IPV4_RE ]]; then
     CLIENT_IP="$(who -m 2>/dev/null | awk '{print $NF}' | tr -d '()' | tail -n 1)"
 fi
-# Валидация: строгий IPv4 либо строка с ':' (IPv6 — hostname содержать ':' не может).
-if [[ "$CLIENT_IP" =~ $IPV4_RE ]] || [[ "$CLIENT_IP" == *:* ]]; then
+# Валидация: строгий IPv4 либо минимум два ':' (валидный IPv6; время из who
+# вроде 10:00 содержит только одно — отсеивается).
+if [[ "$CLIENT_IP" =~ $IPV4_RE ]] || [[ "$CLIENT_IP" == *:*:* ]]; then
     IGNOREIP="127.0.0.1/8 ::1 ${CLIENT_IP}"
     ok "В ignoreip добавлен IP текущей сессии: $CLIENT_IP"
 else
