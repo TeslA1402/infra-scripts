@@ -151,7 +151,7 @@ fi
 # ---------- Шаг 4: обновление и установка пакетов ----------
 step "Обновление системы и установка пакетов (mc, fail2ban)"
 info "Обновление списка пакетов и системы..."
-apt update -qq && apt upgrade -y -qq
+apt update -qq && DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq
 ok "Система обновлена."
 info "Установка mc и fail2ban..."
 apt install -y -qq mc fail2ban
