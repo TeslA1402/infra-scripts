@@ -149,28 +149,44 @@ else
 fi
 
 # ---------- Шаг 4: обновление и установка пакетов ----------
-step "Обновление системы и установка пакетов (mc, fail2ban)"
+step "Обновление системы и установка пакетов (mc, fail2ban, python3-systemd)"
 info "Обновление списка пакетов и системы..."
 apt update -qq && DEBIAN_FRONTEND=noninteractive apt upgrade -y -qq
 ok "Система обновлена."
-info "Установка mc и fail2ban..."
-apt install -y -qq mc fail2ban
+# python3-systemd нужен fail2ban для backend = systemd, на минимальных образах его нет.
+info "Установка mc, fail2ban и python3-systemd..."
+apt install -y -qq mc fail2ban python3-systemd
 ok "Пакеты установлены."
 
 # ---------- Шаг 5: резервное копирование конфигов ----------
 step "Резервное копирование конфигурации SSH"
 SSHD_MAIN="/etc/ssh/sshd_config"
-SSHD_OVERRIDE="/etc/ssh/sshd_config.d/50-cloud-init.conf"
+SSHD_DROPIN="/etc/ssh/sshd_config.d/00-secure-setup.conf"
 BACKUP_SUFFIX=".bak.$(date +%Y%m%d%H%M%S)"
 
-for file in "$SSHD_MAIN" "$SSHD_OVERRIDE"; do
-    if [[ -f "$file" ]]; then
-        cp "$file" "${file}${BACKUP_SUFFIX}"
-        ok "Резервная копия: $file → $(basename "$file")${BACKUP_SUFFIX}"
+# Режим применения параметров определяем заранее (по наличию Include
+# sshd_config.d в основном конфиге) и бэкапим только то, что изменит шаг 7.
+if grep -qE '^[[:space:]]*Include[[:space:]].*sshd_config\.d' "$SSHD_MAIN" 2>/dev/null; then
+    SSH_USE_DROPIN=true
+else
+    SSH_USE_DROPIN=false
+fi
+
+if [[ "$SSH_USE_DROPIN" == true ]]; then
+    if [[ -f "$SSHD_DROPIN" ]]; then
+        cp "$SSHD_DROPIN" "${SSHD_DROPIN}${BACKUP_SUFFIX}"
+        ok "Резервная копия: $SSHD_DROPIN → $(basename "$SSHD_DROPIN")${BACKUP_SUFFIX}"
     else
-        info "Файл $file не найден, пропуск."
+        info "Drop-in $SSHD_DROPIN ещё не существует — будет создан на шаге 7."
     fi
-done
+else
+    if [[ -f "$SSHD_MAIN" ]]; then
+        cp "$SSHD_MAIN" "${SSHD_MAIN}${BACKUP_SUFFIX}"
+        ok "Резервная копия: $SSHD_MAIN → $(basename "$SSHD_MAIN")${BACKUP_SUFFIX}"
+    else
+        info "Файл $SSHD_MAIN не найден, пропуск."
+    fi
+fi
 
 # ---------- Шаг 6: отключение socket-активации SSH ----------
 # На Ubuntu 22.10+ (включая 24.04) sshd по умолчанию запускается через
@@ -197,15 +213,7 @@ else
 fi
 
 # ---------- Функции настройки SSH ----------
-replace_in_file_if_exists() {
-    local file=$1 param=$2 value=$3
-    if [[ -f "$file" ]] && grep -qE "^#?${param}[[:space:]]+" "$file"; then
-        sed -i "s/^#\{0,1\}${param}[[:space:]]\+.*/${param} ${value}/" "$file"
-        return 0
-    fi
-    return 1
-}
-
+# Fallback для старых систем без Include: правим параметры прямо в sshd_config.
 replace_or_add_in_main() {
     local param=$1 value=$2
     if grep -qE "^#?${param}[[:space:]]+" "$SSHD_MAIN"; then
@@ -215,22 +223,32 @@ replace_or_add_in_main() {
     fi
 }
 
-set_ssh_param() {
-    local param=$1 value=$2
-    if replace_in_file_if_exists "$SSHD_OVERRIDE" "$param" "$value"; then
-        ok "$param = $value  ${DIM}(в $(basename "$SSHD_OVERRIDE"))${NC}"
-    else
-        replace_or_add_in_main "$param" "$value"
-        ok "$param = $value  ${DIM}(в $(basename "$SSHD_MAIN"))${NC}"
-    fi
-}
+# ---------- Шаг 7: настройка параметров SSH и фаервола ----------
+step "Настройка параметров SSH и фаервола"
 
-# ---------- Шаг 7: настройка параметров SSH ----------
-step "Настройка параметров SSH"
-set_ssh_param "Port" "$SSH_PORT"
-set_ssh_param "PubkeyAuthentication" "yes"
-set_ssh_param "PasswordAuthentication" "no"
-set_ssh_param "PermitEmptyPasswords" "no"
+if [[ "$SSH_USE_DROPIN" == true ]]; then
+    # Include обрабатывается до основных директив sshd_config, и sshd применяет
+    # первое вхождение параметра. Файл 00-secure-setup.conf сортируется раньше
+    # 50-cloud-init.conf и любых других провайдерских .conf — его значения
+    # побеждают, а основной sshd_config остаётся нетронутым.
+    cat > "$SSHD_DROPIN" <<EOF
+Port $SSH_PORT
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+EOF
+    ok "Параметры записаны в drop-in: $SSHD_DROPIN"
+else
+    info "Include sshd_config.d не найден — правим $SSHD_MAIN напрямую (старая система)."
+    replace_or_add_in_main "Port" "$SSH_PORT"
+    ok "Port = $SSH_PORT  ${DIM}(в $(basename "$SSHD_MAIN"))${NC}"
+    replace_or_add_in_main "PubkeyAuthentication" "yes"
+    ok "PubkeyAuthentication = yes  ${DIM}(в $(basename "$SSHD_MAIN"))${NC}"
+    replace_or_add_in_main "PasswordAuthentication" "no"
+    ok "PasswordAuthentication = no  ${DIM}(в $(basename "$SSHD_MAIN"))${NC}"
+    replace_or_add_in_main "PermitEmptyPasswords" "no"
+    ok "PermitEmptyPasswords = no  ${DIM}(в $(basename "$SSHD_MAIN"))${NC}"
+fi
 
 info "Проверка синтаксиса конфигурации (sshd -t)..."
 if sshd -t; then
@@ -240,9 +258,33 @@ else
     exit 1
 fi
 
+# Защита от lockout: разрешаем порт в ufw ДО рестарта. Для активного ufw
+# правило добавится сразу, для неактивного — сохранится на будущее (идемпотентно).
+if command -v ufw &>/dev/null; then
+    info "Разрешаем порт $SSH_PORT/tcp в ufw..."
+    ufw allow "${SSH_PORT}/tcp"
+    ok "Правило ufw добавлено: allow ${SSH_PORT}/tcp."
+else
+    info "ufw не установлен — локальный фаервол настраивать нечего."
+fi
+
 info "Перезапуск службы SSH..."
 systemctl restart ssh
-ok "SSH перезапущен и слушает порт $SSH_PORT."
+
+# Подтверждаем, что sshd реально слушает новый порт, прежде чем отпустить
+# пользователя: если нет — текущая сессия ещё жива, и есть время на диагностику.
+if command -v ss &>/dev/null; then
+    sleep 1
+    if ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE ":${SSH_PORT}\$"; then
+        ok "SSH перезапущен и слушает порт $SSH_PORT."
+    else
+        fail "SSH перезапущен, но порт $SSH_PORT не слушается!"
+        info "Диагностика: ss -tlnp | grep sshd"
+        exit 1
+    fi
+else
+    warn "Утилита ss не найдена — проверьте порт вручную: ss -tlnp | grep sshd"
+fi
 
 # ---------- Шаг 8: настройка Fail2ban ----------
 step "Настройка Fail2ban"
@@ -250,6 +292,24 @@ JAIL_LOCAL="/etc/fail2ban/jail.local"
 if [[ -f "$JAIL_LOCAL" ]]; then
     cp "$JAIL_LOCAL" "${JAIL_LOCAL}${BACKUP_SUFFIX}"
     ok "Резервная копия: $JAIL_LOCAL → $(basename "$JAIL_LOCAL")${BACKUP_SUFFIX}"
+fi
+
+# IP текущей SSH-сессии добавляем в ignoreip — защита от самобана во время
+# проверки доступа. SSH_CLIENT переживает tmux; fallback — who -m (последнее
+# поле, скобки вокруг IPv6 убираем).
+IPV4_RE='^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'
+CLIENT_IP="${SSH_CLIENT:-}"
+CLIENT_IP="${CLIENT_IP%% *}"
+if ! [[ "$CLIENT_IP" =~ $IPV4_RE ]]; then
+    CLIENT_IP="$(who -m 2>/dev/null | awk '{print $NF}' | tr -d '()' | tail -n 1)"
+fi
+# Валидация: строгий IPv4 либо строка с ':' (IPv6 — hostname содержать ':' не может).
+if [[ "$CLIENT_IP" =~ $IPV4_RE ]] || [[ "$CLIENT_IP" == *:* ]]; then
+    IGNOREIP="127.0.0.1/8 ::1 ${CLIENT_IP}"
+    ok "В ignoreip добавлен IP текущей сессии: $CLIENT_IP"
+else
+    IGNOREIP="127.0.0.1/8 ::1"
+    info "Не удалось определить IP текущей сессии — ignoreip останется дефолтным."
 fi
 
 cat > "$JAIL_LOCAL" <<EOF
@@ -261,13 +321,12 @@ bantime.increment = true
 bantime.factor = 2
 bantime.maxtime = 24h
 backend = systemd
-ignoreip = 127.0.0.1/8 ::1
+ignoreip = ${IGNOREIP}
 
 [sshd]
 enabled = true
 port = $SSH_PORT
 filter = sshd
-logpath = /var/log/auth.log
 EOF
 ok "Конфигурация Fail2ban создана: $JAIL_LOCAL"
 
@@ -315,4 +374,7 @@ box "$RED" \
     "Откройте НОВОЕ окно терминала и проверьте вход:" \
     "  ssh -p $SSH_PORT user@server" \
     "Только убедившись, что новое подключение работает," \
-    "закрывайте старую сессию."
+    "закрывайте старую сессию." \
+    "" \
+    "ОБЛАЧНЫЙ ФАЕРВОЛ: если у сервера есть Hetzner Firewall," \
+    "AWS Security Group и т.п. — откройте порт $SSH_PORT/tcp там."
