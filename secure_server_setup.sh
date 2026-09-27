@@ -166,7 +166,7 @@ BACKUP_SUFFIX=".bak.$(date +%Y%m%d%H%M%S)"
 
 # Режим применения параметров определяем заранее (по наличию Include
 # sshd_config.d в основном конфиге) и бэкапим только то, что изменит шаг 7.
-if grep -qE '^[[:space:]]*Include[[:space:]].*sshd_config\.d' "$SSHD_MAIN" 2>/dev/null; then
+if grep -qiE '^[[:space:]]*Include[[:space:]].*sshd_config\.d' "$SSHD_MAIN" 2>/dev/null; then
     SSH_USE_DROPIN=true
 else
     SSH_USE_DROPIN=false
@@ -300,7 +300,9 @@ fi
 IPV4_RE='^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])$'
 CLIENT_IP="${SSH_CLIENT:-}"
 CLIENT_IP="${CLIENT_IP%% *}"
-if ! [[ "$CLIENT_IP" =~ $IPV4_RE ]]; then
+# Fallback на who -m только если IP не валиден ни как IPv4, ни как IPv6 —
+# иначе валидный IPv6-клиент из SSH_CLIENT был бы перезаписан выводом who.
+if ! [[ "$CLIENT_IP" =~ $IPV4_RE || "$CLIENT_IP" == *:*:* ]]; then
     CLIENT_IP="$(who -m 2>/dev/null | awk '{print $NF}' | tr -d '()' | tail -n 1)"
 fi
 # Валидация: строгий IPv4 либо минимум два ':' (валидный IPv6; время из who
