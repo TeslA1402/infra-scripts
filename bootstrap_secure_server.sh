@@ -5,6 +5,9 @@ set -euo pipefail
 SSH_PORT=""   # Значения по умолчанию нет — запрашивается интерактивно на Шаге 2
 # ============================================================
 
+# Единый суффикс резервных копий для всех изменяемых файлов.
+BACKUP_SUFFIX=".bak.$(date +%Y%m%d%H%M%S)"
+
 # ---------- Цвета и стили ----------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -61,6 +64,14 @@ confirm() {
     [[ "$answer" =~ ^[Yy]$ ]]
 }
 
+confirm_default_yes() {
+    # confirm_default_yes "Вопрос" -> Enter считается ответом "да"
+    local prompt="$1"
+    local answer
+    read -r -p "$(echo -e "${YELLOW}?${NC} ${prompt} [Y/n]: ")" answer || return 1
+    [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]]
+}
+
 ask_ssh_port() {
     # Без интерактивного терминала спросить порт невозможно — явно
     # останавливаемся, а не выбираем что-то за пользователя.
@@ -107,6 +118,196 @@ ask_ssh_port() {
     done
 }
 
+# ---------- Вспомогательные функции для работы с SSH-ключами ----------
+
+has_ssh_keys() {
+    # Возвращает 0, если в файле есть хотя бы одна строка с ключом
+    # (пустые строки и комментарии не считаются).
+    local file=$1
+    [[ -f "$file" ]] || return 1
+    awk '
+        /^[[:space:]]*($|#)/ { next }
+        {
+            for (i = 1; i < NF; i++) {
+                if ($i ~ /^(ssh-|ecdsa-sha2-|sk-)/) {
+                    found = 1
+                    exit
+                }
+            }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$file"
+}
+
+authorized_keys_has_key() {
+    # Сравнивает ключ по паре "тип + base64-блоб", поэтому опции и
+    # комментарий в существующей строке не мешают найти дубликат.
+    local file=$1 key_type=$2 key_blob=$3
+    [[ -f "$file" ]] || return 1
+    awk -v want_type="$key_type" -v want_blob="$key_blob" '
+        /^[[:space:]]*($|#)/ { next }
+        {
+            for (i = 1; i < NF; i++) {
+                if ($i == want_type && $(i + 1) == want_blob) {
+                    found = 1
+                    exit
+                }
+            }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$file"
+}
+
+public_key_fingerprint() {
+    # Проверяет публичный ключ через ssh-keygen и печатает отпечаток.
+    local key=$1 tmp fp
+    tmp=$(mktemp) || return 1
+    printf '%s\n' "$key" > "$tmp"
+    if fp=$(ssh-keygen -lf "$tmp" 2>/dev/null); then
+        rm -f "$tmp"
+        printf '%s\n' "$fp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+ask_target_user() {
+    # Определяет аккаунт, в authorized_keys которого добавлять ключи.
+    local default_user="${SUDO_USER:-root}"
+    local input user home shell
+
+    if ! getent passwd "$default_user" &>/dev/null; then
+        default_user="root"
+    fi
+
+    while true; do
+        read -r -p "$(echo -e "${YELLOW}?${NC} Пользователь для добавления ключей [${default_user}]: ")" input || return 1
+        input="${input%$'\r'}"
+        user="${input:-$default_user}"
+
+        if ! getent passwd "$user" &>/dev/null; then
+            fail "Пользователь '$user' не найден. Укажите существующий аккаунт."
+            continue
+        fi
+
+        home=$(getent passwd "$user" | cut -d: -f6)
+        shell=$(getent passwd "$user" | cut -d: -f7)
+        if [[ -z "$home" || ! -d "$home" ]]; then
+            fail "У пользователя '$user' нет домашнего каталога — добавить ключ некуда."
+            continue
+        fi
+        if [[ "$shell" == */nologin || "$shell" == */false ]]; then
+            warn "У пользователя '$user' оболочка $shell — вход по SSH может быть запрещён."
+        fi
+
+        TARGET_USER="$user"
+        TARGET_HOME="$home"
+        return 0
+    done
+}
+
+check_home_permissions() {
+    # StrictModes в sshd требует, чтобы домашний каталог не был доступен
+    # на запись группе и остальным, иначе ключ может быть отклонён.
+    local user=$1 home=$2 mode
+    [[ -d "$home" ]] || return 0
+    mode=$(stat -c '%a' "$home" 2>/dev/null || true)
+    [[ -n "$mode" ]] || return 0
+    if (( (8#$mode & 8#022) != 0 )); then
+        warn "Домашний каталог пользователя $user ($home) доступен на запись группе/остальным (права $mode)."
+        info "sshd (StrictModes) может отклонить ключ. Рекомендуется: chmod go-w $home"
+    fi
+}
+
+add_public_keys() {
+    # Последовательный ввод: один ключ за раз, пустая строка — завершение.
+    if ! command -v ssh-keygen &>/dev/null; then
+        warn "ssh-keygen не найден — добавление ключей недоступно."
+        return 0
+    fi
+
+    info "Ключи добавляются в authorized_keys выбранного пользователя."
+    ask_target_user || return 0
+
+    local group authfile sshdir
+    group=$(id -gn "$TARGET_USER")
+    sshdir="${TARGET_HOME}/.ssh"
+    authfile="${sshdir}/authorized_keys"
+
+    local added=0 skipped=0 rejected=0 backed_up=false
+    local line key_type key_blob rest fp fp_short
+
+    info "Вставьте публичный ключ одной строкой. Пустая строка — закончить."
+    while true; do
+        read -r -p "$(echo -e "${YELLOW}?${NC} Публичный ключ: ")" line || break
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && break
+
+        key_type=""
+        key_blob=""
+        rest=""
+        read -r key_type key_blob rest <<< "$line"
+
+        if [[ ! "$key_type" =~ ^(ssh-|ecdsa-sha2-|sk-) || -z "$key_blob" ]]; then
+            fail "Некорректный формат. Нужен ключ без опций: 'ssh-ed25519 AAAA... comment'."
+            rejected=$((rejected + 1))
+            continue
+        fi
+
+        if ! fp=$(public_key_fingerprint "$line"); then
+            fail "Ключ не прошёл проверку ssh-keygen — пропущен."
+            rejected=$((rejected + 1))
+            continue
+        fi
+
+        if authorized_keys_has_key "$authfile" "$key_type" "$key_blob"; then
+            warn "Ключ уже есть в $authfile — пропущен."
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        # Резервная копия — только перед первым реальным изменением файла.
+        if [[ "$backed_up" == false ]]; then
+            if [[ -f "$authfile" ]]; then
+                cp -p "$authfile" "${authfile}${BACKUP_SUFFIX}"
+                ok "Резервная копия: $authfile → $(basename "$authfile")${BACKUP_SUFFIX}"
+            fi
+            backed_up=true
+        fi
+
+        install -d -m 700 -o "$TARGET_USER" -g "$group" "$sshdir"
+        # Если файл не заканчивается переводом строки, добавляем его,
+        # чтобы новый ключ не склеился с последней строкой.
+        if [[ -s "$authfile" && -n "$(tail -c 1 "$authfile" 2>/dev/null)" ]]; then
+            echo >> "$authfile"
+        fi
+        printf '%s\n' "$line" >> "$authfile"
+        chown "$TARGET_USER:$group" "$authfile"
+        chmod 600 "$authfile"
+
+        fp_short=$(awk '{print $2, $NF}' <<< "$fp")
+        ok "Ключ добавлен: $fp_short"
+        added=$((added + 1))
+    done
+
+    echo
+    if (( added > 0 )); then
+        ok "Добавлено ключей: $added. Файл: $authfile (права 600)."
+    else
+        info "Новые ключи не добавлены."
+    fi
+    if (( skipped > 0 )); then
+        info "Пропущено уже добавленных: $skipped."
+    fi
+    if (( rejected > 0 )); then
+        info "Отклонено некорректных: $rejected."
+    fi
+    return 0
+}
+
 # ---------- Заголовок ----------
 clear 2>/dev/null || true
 box "$BOLD$GREEN" "Автоматическая настройка SSH и Fail2ban"
@@ -125,27 +326,81 @@ step "Выбор порта SSH"
 ask_ssh_port
 ok "Будет использован порт: $SSH_PORT"
 
-# ---------- Шаг 3: проверка SSH-ключей (защита от блокировки доступа) ----------
-step "Проверка наличия SSH-ключей"
-KEY_FOUND=false
+# ---------- Шаг 3: проверка и добавление SSH-ключей (защита от блокировки доступа) ----------
+step "Проверка и добавление SSH-ключей"
+
+# Защищаем именно того пользователя, под которым администратор входит на
+# сервер: при запуске через sudo это SUDO_USER, иначе root.
+LOGIN_USER="${SUDO_USER:-root}"
+if ! getent passwd "$LOGIN_USER" &>/dev/null; then
+    LOGIN_USER="root"
+fi
+LOGIN_HOME=$(getent passwd "$LOGIN_USER" | cut -d: -f6)
+if [[ -z "$LOGIN_HOME" ]]; then
+    if [[ "$LOGIN_USER" == "root" ]]; then
+        LOGIN_HOME="/root"
+    else
+        LOGIN_HOME="/home/${LOGIN_USER}"
+    fi
+fi
+LOGIN_AUTH="${LOGIN_HOME}/.ssh/authorized_keys"
+
+LOGIN_KEY_FOUND=false
+if has_ssh_keys "$LOGIN_AUTH"; then
+    LOGIN_KEY_FOUND=true
+    ok "Найден файл с ключами: $LOGIN_AUTH"
+fi
+
+OTHER_KEYS_FOUND=false
 for authfile in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do
-    if [[ -s "$authfile" ]]; then
-        KEY_FOUND=true
-        ok "Найден файл с ключами: $authfile"
+    [[ "$authfile" == "$LOGIN_AUTH" ]] && continue
+    if has_ssh_keys "$authfile"; then
+        OTHER_KEYS_FOUND=true
+        ok "Найден файл с ключами (другой пользователь): $authfile"
     fi
 done
 
-if [[ "$KEY_FOUND" == false ]]; then
-    warn "Не найдено ни одного authorized_keys с ключами."
-    box "$RED" \
-        "ВНИМАНИЕ: пароль будет отключён, а SSH-ключи не найдены!" \
-        "Если продолжить сейчас, вы можете потерять доступ к серверу."
-    if ! confirm "Всё равно продолжить настройку?"; then
-        info "Настройка отменена пользователем. Ничего не изменено."
-        exit 1
+if [[ "$LOGIN_KEY_FOUND" == true ]]; then
+    ok "У пользователя $LOGIN_USER есть SSH-ключи — отключение входа по паролю безопасно."
+    check_home_permissions "$LOGIN_USER" "$LOGIN_HOME"
+    if confirm "Добавить ещё публичный ключ?"; then
+        add_public_keys
+        if [[ -n "${TARGET_USER:-}" && "$TARGET_USER" != "$LOGIN_USER" ]]; then
+            check_home_permissions "$TARGET_USER" "$TARGET_HOME"
+        fi
     fi
 else
-    ok "SSH-ключи найдены — отключение входа по паролю безопасно."
+    if [[ "$OTHER_KEYS_FOUND" == true ]]; then
+        warn "У пользователя $LOGIN_USER нет SSH-ключей (ключи найдены только у других пользователей)."
+    else
+        warn "У пользователя $LOGIN_USER нет SSH-ключей."
+    fi
+    info "Сейчас можно добавить публичный ключ для пользователя $LOGIN_USER."
+    if confirm_default_yes "Добавить публичный ключ сейчас?"; then
+        add_public_keys
+    fi
+
+    # Если ключ добавляли другому пользователю, проверяем именно его файл.
+    CHECK_USER="${TARGET_USER:-$LOGIN_USER}"
+    CHECK_HOME="${TARGET_HOME:-$LOGIN_HOME}"
+    CHECK_AUTH="${CHECK_HOME}/.ssh/authorized_keys"
+
+    if has_ssh_keys "$CHECK_AUTH"; then
+        LOGIN_USER="$CHECK_USER"
+        LOGIN_HOME="$CHECK_HOME"
+        LOGIN_AUTH="$CHECK_AUTH"
+        LOGIN_KEY_FOUND=true
+        ok "У пользователя $LOGIN_USER есть SSH-ключи — отключение входа по паролю безопасно."
+        check_home_permissions "$LOGIN_USER" "$LOGIN_HOME"
+    else
+        warn "У пользователя $CHECK_USER SSH-ключи так и не найдены."
+        box "$RED" \
+            "ВНИМАНИЕ: у пользователя $CHECK_USER нет SSH-ключей!" \
+            "Вход по паролю не будет отключён." \
+            "Добавьте ключ и запустите скрипт снова."
+        info "Настройка остановлена. Конфигурация SSH не изменялась."
+        exit 1
+    fi
 fi
 
 # ---------- Шаг 4: обновление и установка пакетов ----------
@@ -162,7 +417,6 @@ ok "Пакеты установлены."
 step "Резервное копирование конфигурации SSH"
 SSHD_MAIN="/etc/ssh/sshd_config"
 SSHD_DROPIN="/etc/ssh/sshd_config.d/00-secure-setup.conf"
-BACKUP_SUFFIX=".bak.$(date +%Y%m%d%H%M%S)"
 
 # Режим применения параметров определяем заранее (по наличию Include
 # sshd_config.d в основном конфиге) и бэкапим только то, что изменит шаг 7.
@@ -362,6 +616,7 @@ box "$BOLD$GREEN" \
     "Настройка завершена успешно!" \
     "" \
     "SSH-порт:            $SSH_PORT" \
+    "Пользователь:        $LOGIN_USER" \
     "Вход по паролю:      отключён" \
     "Вход по ключу:       разрешён" \
     "Fail2ban:             активен (jail sshd)" \
@@ -375,7 +630,7 @@ echo
 box "$RED" \
     "ВАЖНО: не закрывайте текущую SSH-сессию!" \
     "Откройте НОВОЕ окно терминала и проверьте вход:" \
-    "  ssh -p $SSH_PORT user@server" \
+    "  ssh -p $SSH_PORT ${LOGIN_USER}@server" \
     "Только убедившись, что новое подключение работает," \
     "закрывайте старую сессию." \
     "" \
