@@ -504,6 +504,12 @@ else
     ok "PermitEmptyPasswords = no  ${DIM}(в $(basename "$SSHD_MAIN"))${NC}"
 fi
 
+# sshd -t от root проверяет /run/sshd ещё до выхода из режима проверки, а
+# создаёт каталог systemd (RuntimeDirectory) только при старте ssh.service —
+# в контейнерах и после socket-активации его может не быть. Создаём сами,
+# как systemd: идемпотентно, права заодно чинятся и у существующего каталога.
+install -d -m 0755 -o root -g root /run/sshd
+
 info "Проверка синтаксиса конфигурации (sshd -t)..."
 if sshd -t; then
     ok "Конфигурация SSH корректна."
